@@ -9,16 +9,23 @@ import { DefaultAzureCredential } from "@azure/identity";
 import type {
   CreateFeedbackRequest,
   Feedback,
+  FeedbackStatus,
+  UpdateFeedbackStatusRequest,
   VoteResult,
 } from "../shared/contracts.js";
 
 export class FeedbackNotFoundError extends Error {}
+export class InvalidFeedbackStatusTransitionError extends Error {}
 
 export interface FeedbackStorage {
   initialize(): Promise<void>;
   list(): Promise<Feedback[]>;
   create(input: CreateFeedbackRequest, options?: CreateOptions): Promise<Feedback>;
   vote(feedbackId: string, clientId: string): Promise<VoteResult>;
+  updateStatus?(
+    feedbackId: string,
+    input: UpdateFeedbackStatusRequest,
+  ): Promise<Feedback>;
   checkHealth(): Promise<void>;
 }
 
@@ -34,6 +41,7 @@ interface FeedbackEntity extends TableEntity {
   displayName: string;
   votes: number;
   createdAt: string;
+  status?: FeedbackStatus;
 }
 
 const toFeedback = (entity: FeedbackEntity): Feedback => ({
@@ -44,7 +52,27 @@ const toFeedback = (entity: FeedbackEntity): Feedback => ({
   displayName: entity.displayName,
   votes: entity.votes,
   createdAt: entity.createdAt,
+  status: entity.status ?? "new",
 });
+
+const nextStatus: Record<FeedbackStatus, FeedbackStatus | undefined> = {
+  new: "planned",
+  planned: "done",
+  done: undefined,
+};
+
+const assertNextStatus = (
+  current: FeedbackStatus,
+  requested: FeedbackStatus,
+): void => {
+  if (nextStatus[current] !== requested) {
+    throw new InvalidFeedbackStatusTransitionError(
+      `Feedback can only move from ${current} to ${
+        nextStatus[current] ?? "no further status"
+      }.`,
+    );
+  }
+};
 
 export class InMemoryFeedbackStorage implements FeedbackStorage {
   private readonly feedback = new Map<string, Feedback>();
@@ -69,12 +97,29 @@ export class InMemoryFeedbackStorage implements FeedbackStorage {
       ...input,
       votes: 0,
       createdAt: options.createdAt ?? new Date().toISOString(),
+      status: "new",
     };
     if (this.feedback.has(item.id)) {
       return Promise.resolve(this.feedback.get(item.id) as Feedback);
     }
     this.feedback.set(item.id, item);
     return Promise.resolve(item);
+  }
+
+  updateStatus(
+    feedbackId: string,
+    { status }: UpdateFeedbackStatusRequest,
+  ): Promise<Feedback> {
+    const feedback = this.feedback.get(feedbackId);
+    if (!feedback) {
+      return Promise.reject(
+        new FeedbackNotFoundError(`Feedback ${feedbackId} was not found.`),
+      );
+    }
+    assertNextStatus(feedback.status, status);
+    const updated = { ...feedback, status };
+    this.feedback.set(feedbackId, updated);
+    return Promise.resolve(updated);
   }
 
   vote(feedbackId: string, clientId: string): Promise<VoteResult> {
@@ -145,6 +190,7 @@ export class AzureTableFeedbackStorage implements FeedbackStorage {
       ...input,
       votes: 0,
       createdAt: options.createdAt ?? new Date().toISOString(),
+      status: "new",
     };
     await this.table.createEntity<FeedbackEntity>({
       partitionKey: item.id,
@@ -152,8 +198,48 @@ export class AzureTableFeedbackStorage implements FeedbackStorage {
       ...input,
       votes: item.votes,
       createdAt: item.createdAt,
+      status: item.status,
     });
     return item;
+  }
+
+  async updateStatus(
+    feedbackId: string,
+    { status }: UpdateFeedbackStatusRequest,
+  ): Promise<Feedback> {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      let entity: FeedbackEntity;
+      try {
+        entity = await this.table.getEntity<FeedbackEntity>(
+          feedbackId,
+          "feedback",
+        );
+      } catch (error) {
+        if (isStatus(error, 404)) {
+          throw new FeedbackNotFoundError(
+            `Feedback ${feedbackId} was not found.`,
+          );
+        }
+        throw error;
+      }
+
+      const currentStatus = entity.status ?? "new";
+      assertNextStatus(currentStatus, status);
+      const updated: FeedbackEntity = { ...entity, status };
+      try {
+        const etag =
+          typeof entity.etag === "string" ? entity.etag : undefined;
+        await this.table.updateEntity(updated, "Replace", {
+          etag,
+        });
+        return toFeedback(updated);
+      } catch (error) {
+        if (!isStatus(error, 412) || attempt === 3) {
+          throw error;
+        }
+      }
+    }
+    throw new Error("Unable to update feedback status.");
   }
 
   async vote(feedbackId: string, clientId: string): Promise<VoteResult> {

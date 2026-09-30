@@ -38,14 +38,25 @@ export const voteRequestSchema = z.object({
     .regex(/^[A-Za-z0-9_-]+$/, "The workshop client ID is invalid."),
 });
 
+export const feedbackStatuses = ["new", "planned", "done"] as const;
+
+export const updateFeedbackStatusSchema = z.object({
+  status: z.enum(feedbackStatuses),
+});
+
 export type FeedbackCategory = (typeof feedbackCategories)[number];
+export type FeedbackStatus = (typeof feedbackStatuses)[number];
 export type CreateFeedbackRequest = z.infer<typeof createFeedbackSchema>;
 export type VoteRequest = z.infer<typeof voteRequestSchema>;
+export type UpdateFeedbackStatusRequest = z.infer<
+  typeof updateFeedbackStatusSchema
+>;
 
 export interface Feedback extends CreateFeedbackRequest {
   id: string;
   votes: number;
   createdAt: string;
+  status: FeedbackStatus;
 }
 
 export interface VoteResult {
