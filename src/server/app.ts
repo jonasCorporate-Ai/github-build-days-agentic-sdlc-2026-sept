@@ -7,14 +7,17 @@ import { rateLimit } from "express-rate-limit";
 import { ZodError, type ZodType } from "zod";
 import {
   createFeedbackSchema,
+  updateFeedbackStatusSchema,
   voteRequestSchema,
   type ApiError,
   type CreateFeedbackRequest,
+  type UpdateFeedbackStatusRequest,
   type VoteRequest,
 } from "../shared/contracts.js";
 import { logger as defaultLogger, type Logger } from "./logger.js";
 import {
   FeedbackNotFoundError,
+  InvalidFeedbackStatusTransitionError,
   type FeedbackStorage,
 } from "./storage.js";
 
@@ -100,6 +103,28 @@ export const createApp = ({
     },
   );
 
+  app.patch(
+    "/api/feedback/:id/status",
+    validateBody(updateFeedbackStatusSchema),
+    async (request, response) => {
+      const id = request.params.id;
+      if (typeof id !== "string") {
+        response.status(404).json({
+          error: { code: "NOT_FOUND", message: "Feedback was not found." },
+        } satisfies ApiError);
+        return;
+      }
+      if (!storage.updateStatus) {
+        throw new Error("Feedback status updates are not configured.");
+      }
+      const feedback = await storage.updateStatus(
+        id,
+        request.body as UpdateFeedbackStatusRequest,
+      );
+      response.json({ feedback });
+    },
+  );
+
   app.post(
     "/api/feedback/:id/votes",
     validateBody(voteRequestSchema),
@@ -128,6 +153,15 @@ export const createApp = ({
     if (error instanceof FeedbackNotFoundError) {
       response.status(404).json({
         error: { code: "NOT_FOUND", message: "Feedback was not found." },
+      } satisfies ApiError);
+      return;
+    }
+    if (error instanceof InvalidFeedbackStatusTransitionError) {
+      response.status(409).json({
+        error: {
+          code: "STATUS_CONFLICT",
+          message: error.message,
+        },
       } satisfies ApiError);
       return;
     }
