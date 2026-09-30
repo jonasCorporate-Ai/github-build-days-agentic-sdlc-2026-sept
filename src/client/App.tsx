@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import {
   feedbackCategories,
   fieldLimits,
@@ -8,7 +8,10 @@ import {
 import {
   ApiRequestError,
   createFeedback,
+  type FeedbackStatus,
+  type FeedbackWithStatus,
   listFeedback,
+  updateFeedbackStatus,
   voteForFeedback,
 } from "./api.js";
 
@@ -28,13 +31,33 @@ const getClientId = (): string => {
   return created;
 };
 
+const nextStatusFor = (
+  status: FeedbackStatus,
+): FeedbackStatus | undefined => {
+  switch (status) {
+    case "new":
+      return "planned";
+    case "planned":
+      return "done";
+    case "done":
+      return undefined;
+  }
+};
+
 export function App() {
-  const [items, setItems] = useState<Feedback[]>([]);
+  const [items, setItems] = useState<FeedbackWithStatus[]>([]);
   const [form, setForm] = useState(emptyForm);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({});
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [votingId, setVotingId] = useState<string>();
+  const [statusUpdatingIds, setStatusUpdatingIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [statusMessages, setStatusMessages] = useState<
+    Record<string, { kind: "pending" | "success" | "error"; message: string }>
+  >({});
+  const statusRequests = useRef(new Set<string>());
   const [error, setError] = useState<string>();
   const [loadFailed, setLoadFailed] = useState(false);
   const [notice, setNotice] = useState<string>();
@@ -79,7 +102,7 @@ export function App() {
     }
   }
 
-  async function vote(item: Feedback) {
+  async function vote(item: FeedbackWithStatus) {
     setVotingId(item.id);
     setError(undefined);
     setNotice(undefined);
@@ -87,7 +110,9 @@ export function App() {
       const result = await voteForFeedback(item.id, getClientId());
       setItems((current) =>
         current.map((candidate) =>
-          candidate.id === item.id ? result.feedback : candidate,
+          candidate.id === item.id
+            ? { ...result.feedback, status: candidate.status }
+            : candidate,
         ),
       );
       setNotice(
@@ -99,6 +124,51 @@ export function App() {
       setError(messageFor(voteError));
     } finally {
       setVotingId(undefined);
+    }
+  }
+
+  async function updateStatus(item: FeedbackWithStatus, status: FeedbackStatus) {
+    if (statusRequests.current.has(item.id)) return;
+    statusRequests.current.add(item.id);
+    setStatusUpdatingIds((current) => new Set(current).add(item.id));
+    setStatusMessages((current) => ({
+      ...current,
+      [item.id]: {
+        kind: "pending",
+        message: `Updating status to ${status}…`,
+      },
+    }));
+    try {
+      const feedback = await updateFeedbackStatus(item.id, status);
+      setItems((current) =>
+        current.map((candidate) =>
+          candidate.id === item.id
+            ? { ...candidate, status: feedback.status }
+            : candidate,
+        ),
+      );
+      setStatusMessages((current) => ({
+        ...current,
+        [item.id]: {
+          kind: "success",
+          message: `Status updated to ${feedback.status}.`,
+        },
+      }));
+    } catch (statusError) {
+      setStatusMessages((current) => ({
+        ...current,
+        [item.id]: {
+          kind: "error",
+          message: `Status was not updated. ${messageFor(statusError)} Select “Move to ${status}” to retry.`,
+        },
+      }));
+    } finally {
+      statusRequests.current.delete(item.id);
+      setStatusUpdatingIds((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
     }
   }
 
@@ -205,35 +275,80 @@ export function App() {
             </div>
           ) : (
             <ul className="feedback-list">
-              {items.map((item) => (
-                <li className="feedback-card" key={item.id}>
-                  <div className="card-topline">
-                    <span className={`category category-${item.category}`}>
-                      {item.category}
-                    </span>
-                    <time dateTime={item.createdAt}>
-                      {new Intl.DateTimeFormat(undefined, {
-                        dateStyle: "medium",
-                      }).format(new Date(item.createdAt))}
-                    </time>
-                  </div>
-                  <h3>{item.title}</h3>
-                  <p>{item.description}</p>
-                  <div className="card-footer">
-                    <span>By {item.displayName}</span>
-                    <button
-                      className="vote"
-                      type="button"
-                      disabled={votingId === item.id}
-                      aria-label={`Vote for ${item.title}. ${item.votes} votes`}
-                      onClick={() => void vote(item)}
-                    >
-                      <span aria-hidden="true">▲</span>
-                      {votingId === item.id ? "Voting…" : item.votes}
-                    </button>
-                  </div>
-                </li>
-              ))}
+              {items.map((item) => {
+                const nextStatus = nextStatusFor(item.status);
+                const statusMessage = statusMessages[item.id];
+                const isUpdating = statusUpdatingIds.has(item.id);
+                return (
+                  <li className="feedback-card" key={item.id}>
+                    <div className="card-topline">
+                      <span className={`category category-${item.category}`}>
+                        {item.category}
+                      </span>
+                      <time dateTime={item.createdAt}>
+                        {new Intl.DateTimeFormat(undefined, {
+                          dateStyle: "medium",
+                        }).format(new Date(item.createdAt))}
+                      </time>
+                    </div>
+                    <h3>{item.title}</h3>
+                    <p>{item.description}</p>
+                    <p className="feedback-status">Status: {item.status}</p>
+                    <div className="status-control">
+                      {nextStatus && (
+                        <button
+                          type="button"
+                          disabled={isUpdating}
+                          aria-label={
+                            isUpdating
+                              ? `Updating status for ${item.title}`
+                              : `Move ${item.title} to ${nextStatus}`
+                          }
+                          onClick={() => void updateStatus(item, nextStatus)}
+                        >
+                          {isUpdating
+                            ? "Updating…"
+                            : `Move to ${nextStatus}`}
+                        </button>
+                      )}
+                      {statusMessage && (
+                        <p
+                          className={
+                            statusMessage.kind === "error"
+                              ? "error"
+                              : statusMessage.kind === "success"
+                                ? "success"
+                                : undefined
+                          }
+                          role={
+                            statusMessage.kind === "error" ? "alert" : "status"
+                          }
+                          aria-live={
+                            statusMessage.kind === "error"
+                              ? "assertive"
+                              : "polite"
+                          }
+                        >
+                          {statusMessage.message}
+                        </p>
+                      )}
+                    </div>
+                    <div className="card-footer">
+                      <span>By {item.displayName}</span>
+                      <button
+                        className="vote"
+                        type="button"
+                        disabled={votingId === item.id}
+                        aria-label={`Vote for ${item.title}. ${item.votes} votes`}
+                        onClick={() => void vote(item)}
+                      >
+                        <span aria-hidden="true">▲</span>
+                        {votingId === item.id ? "Voting…" : item.votes}
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </section>
