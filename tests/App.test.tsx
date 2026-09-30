@@ -37,6 +37,7 @@ describe("feedback board", () => {
             Feedback,
             "id" | "votes" | "createdAt"
           >),
+          status: "new",
           votes: 0,
           createdAt: "2025-01-01T00:00:00.000Z",
         };
@@ -100,6 +101,126 @@ describe("feedback board", () => {
 
     expect(await screen.findByText("Enter a title.")).toBeVisible();
     expect(screen.getByLabelText("Title")).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("advances status accessibly without changing the vote count", async () => {
+    const item: Feedback = {
+      id: "feedback-status",
+      title: "More examples",
+      description: "Show one more example.",
+      category: "content",
+      displayName: "Sam",
+      status: "new",
+      votes: 2,
+      createdAt: "2025-01-01T00:00:00.000Z",
+    };
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ items: [item] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ feedback: { ...item, status: "planned" } }),
+      );
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "More examples" });
+
+    expect(screen.getByText("Status: new")).toBeVisible();
+    await user.click(
+      screen.getByRole("button", { name: "Move More examples to planned" }),
+    );
+
+    expect(await screen.findByText("Status: planned")).toBeVisible();
+    expect(
+      screen.getByRole("button", {
+        name: "Vote for More examples. 2 votes",
+      }),
+    ).toBeVisible();
+    expect(globalThis.fetch).toHaveBeenLastCalledWith(
+      "/api/feedback/feedback-status/status",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ status: "planned" }),
+      }),
+    );
+  });
+
+  it("announces a pending update and disables duplicate submissions", async () => {
+    const item: Feedback = {
+      id: "feedback-pending",
+      title: "Add recovery time",
+      description: "Allow time for troubleshooting.",
+      category: "facilitation",
+      displayName: "Kai",
+      status: "new",
+      votes: 0,
+      createdAt: "2025-01-01T00:00:00.000Z",
+    };
+    let finishUpdate!: (response: Response) => void;
+    const pendingUpdate = new Promise<Response>((resolve) => {
+      finishUpdate = resolve;
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ items: [item] }))
+      .mockReturnValueOnce(pendingUpdate);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "Add recovery time" });
+    const advance = screen.getByRole("button", {
+      name: "Move Add recovery time to planned",
+    });
+
+    await user.click(advance);
+    expect(advance).toBeDisabled();
+    expect(screen.getByText("Updating status to planned…")).toBeVisible();
+
+    finishUpdate(jsonResponse({ feedback: { ...item, status: "planned" } }));
+    expect(await screen.findByText("Status: planned")).toBeVisible();
+  });
+
+  it("retains the confirmed status and allows retry after a failed update", async () => {
+    const item: Feedback = {
+      id: "feedback-retry",
+      title: "Improve the checklist",
+      description: "Keep retry available when an update fails.",
+      category: "facilitation",
+      displayName: "Lin",
+      status: "new",
+      votes: 0,
+      createdAt: "2025-01-01T00:00:00.000Z",
+    };
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ items: [item] }))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: {
+              code: "CONFLICT",
+              message: "The status changed. Refresh and try again.",
+            },
+          },
+          409,
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ feedback: { ...item, status: "planned" } }),
+      );
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "Improve the checklist" });
+    const advance = screen.getByRole("button", {
+      name: "Move Improve the checklist to planned",
+    });
+
+    await user.click(advance);
+    expect(
+      await screen.findByText(
+        "Status was not updated. The status changed. Refresh and try again. Select “Move to planned” to retry.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByText("Status: new")).toBeVisible();
+    expect(advance).toBeEnabled();
+
+    await user.click(advance);
+    expect(await screen.findByText("Status: planned")).toBeVisible();
   });
 
   it("offers retry after a loading error", async () => {

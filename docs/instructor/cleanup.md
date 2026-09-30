@@ -15,6 +15,12 @@ configuration after retaining the evidence required by the workshop owner.
 
 ## Azure cleanup
 
+Before deleting a retained team app, inspect its App Service access restrictions
+for a stale `github-actions-<run-id>` rule left by a failed deployment. Remove
+only the run-specific temporary rule and confirm that no matching rule remains;
+preserve all `workshop-*` instructor allowlist rules while the app is in use.
+The recovery commands are in [readiness.md](readiness.md#workshop-network-ingress).
+
 List target groups before deletion:
 
 ```powershell

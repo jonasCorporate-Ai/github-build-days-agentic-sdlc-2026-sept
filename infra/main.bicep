@@ -16,6 +16,11 @@ param appServicePlanSku string = 'B1'
 @maxLength(63)
 param feedbackTableName string = 'Feedback'
 
+@description('Explicit IPv4 or IPv6 CIDR ranges allowed to access the workshop app.')
+@minLength(1)
+@maxLength(100)
+param workshopAllowedCidrs array
+
 @description('Additional tags applied to every resource.')
 param tags object = {}
 
@@ -120,6 +125,14 @@ module webApp 'br/public:avm/res/web/site:0.24.0' = {
       scmMinTlsVersion: '1.2'
       use32BitWorkerProcess: false
       webSocketsEnabled: false
+      ipSecurityRestrictions: [for (cidr, index) in workshopAllowedCidrs: {
+        name: 'workshop-${index + 1}'
+        ipAddress: cidr
+        action: 'Allow'
+        priority: 100 + index
+        description: 'Instructor-approved workshop network'
+      }]
+      ipSecurityRestrictionsDefaultAction: 'Deny'
     }
     configs: [
       {

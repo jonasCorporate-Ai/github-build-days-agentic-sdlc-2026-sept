@@ -50,6 +50,80 @@ open the team repository, and record that evidence separately.
 The JSON output contains only check names and observed configuration; it does
 not print tokens or variable values. Do not commit event-specific output.
 
+## Workshop network ingress
+
+Before deployment, obtain the instructor-approved participant and instructor
+network CIDRs from the venue/network owner. Configure the protected `workshop`
+environment variable `WORKSHOP_ALLOWED_CIDRS` as a comma-separated list of
+strict IPv4 or IPv6 network CIDRs; do not put attendee ranges in the repository,
+issue, or deployment artifacts. The deployment workflow rejects an empty,
+malformed, or oversized list before deploying infrastructure. The Bicep
+example's `198.51.100.0/24` is reserved documentation space and must never be
+used as an event network.
+
+Set the value as a non-secret variable on the protected `workshop` environment
+for each team repository. For example, after loading only the approved
+instructor-provided value into the current PowerShell process:
+
+```powershell
+gh variable set WORKSHOP_ALLOWED_CIDRS `
+  --repo "$env:GH_ORG/$env:TEAM_REPO" `
+  --env workshop `
+  --body $env:WORKSHOP_ALLOWED_CIDRS
+```
+
+From an approved network, verify the board and API are reachable. From a
+separate network outside the allowlist, verify that both the health endpoint
+and feedback API return HTTP `403`:
+
+```powershell
+curl.exe --fail --silent --show-error https://<app-name>.azurewebsites.net/health
+curl.exe --silent --output NUL --write-out "%{http_code}" `
+  https://<app-name>.azurewebsites.net/health
+curl.exe --silent --output NUL --write-out "%{http_code}" `
+  https://<app-name>.azurewebsites.net/api/feedback
+```
+
+The health check from an approved network must succeed; both requests run from
+outside the approved networks must print `403`.
+Record the result and test date in the instructor readiness record without
+recording personal or attendee addresses in source control. Network allowlisting
+is not authentication: anyone on an approved network can use the application.
+
+The deployment workflow admits only that run's GitHub runner IPv4 `/32` while
+it checks health, readiness, feedback creation, and voting. It removes the
+run-specific rule even when verification fails, confirms the rule is absent,
+and checks that the runner is denied afterward. Deployment evidence is not
+published if cleanup or outsider denial cannot be confirmed.
+
+If a deployment run reports cleanup failure, inspect only the rule for that
+run and remove that exact temporary rule; do not remove `workshop-*` allowlist
+rules:
+
+```powershell
+$resourceGroup = "<assigned-team-resource-group>"
+$appName = "<deployed-app-name>"
+$runId = "<failed-github-run-id>"
+$ruleName = "github-actions-$runId"
+az webapp config access-restriction show `
+  --resource-group $resourceGroup `
+  --name $appName `
+  --output table
+az webapp config access-restriction remove `
+  --resource-group $resourceGroup `
+  --name $appName `
+  --rule-name $ruleName
+$remaining = az webapp config access-restriction show `
+  --resource-group $resourceGroup `
+  --name $appName `
+  --query "ipSecurityRestrictions[?name=='$ruleName'] | length(@)" `
+  --output tsv
+if ($remaining -ne "0") { throw "Temporary runner rule remains: $ruleName" }
+```
+
+After recovery, repeat the allowed-network and outside-network checks before
+accepting deployment evidence.
+
 ## Readiness matrix
 
 | Area | Verification | Evidence |
@@ -62,9 +136,9 @@ not print tokens or variable values. Do not commit event-specific output.
 | CI | Implemented checks execute real commands | Run URL |
 | Security | CodeQL/dependency review or recorded fallback | Run/setting URL |
 | OIDC | Numeric owner/repository claims and exact environment; no secret | Preparation report and sign-in evidence |
-| Infrastructure | Bicep validation and `what-if` | Successful `infra-validate.yml` run |
-| Deployment | Protected deployment completes | Deployment URL |
-| Runtime | Health, readiness, feedback, and voting pass | Job summary |
+| Infrastructure | Bicep validation and `what-if`; explicit ingress CIDRs | Successful `infra-validate.yml` run and reviewed network source |
+| Deployment | Protected deployment completes; temporary runner rule is removed | Deployment URL and cleanup-confirmed artifact |
+| Runtime | Allowed network reaches the board; outside network receives HTTP 403; health, readiness, feedback, and voting pass | Job summary plus instructor ingress check |
 | Copilot App | Manual sign-in and repository-open check | Instructor roster |
 | App sessions | Chat plus isolated local/worktree session creation | Instructor roster and test sessions |
 | App modes | Interactive, Plan, and Autopilot available | Test session evidence |

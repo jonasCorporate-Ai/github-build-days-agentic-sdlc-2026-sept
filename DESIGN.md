@@ -138,6 +138,11 @@ approvals, health/readiness probes, and the focused feedback smoke test.
   environment; no long-lived Azure client secret is stored.
 - App Service uses a system-assigned managed identity with only the required
   Storage Table data-plane role.
+- The deployed feedback board allows inbound requests only from explicitly
+  configured instructor-approved workshop CIDRs and denies other sources.
+  Deployment smoke checks temporarily allow only the current runner's IPv4
+  `/32`, then remove and confirm removal before publishing evidence. This
+  network boundary is not user authentication.
 - Deployment environments may require human approval.
 - GitHub workflows default to read-only permissions.
 - Agentic workflows use narrow safe outputs and may not self-approve protected changes.

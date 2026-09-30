@@ -1,6 +1,8 @@
 import {
   createFeedbackSchema,
+  feedbackStatuses,
   fieldLimits,
+  updateFeedbackStatusSchema,
   voteRequestSchema,
 } from "../src/shared/contracts.js";
 
@@ -48,5 +50,15 @@ describe("feedback contracts", () => {
     expect(voteRequestSchema.safeParse({ clientId: "not/valid" }).success).toBe(
       false,
     );
+  });
+
+  it("accepts exactly the supported feedback statuses", () => {
+    expect(feedbackStatuses).toEqual(["new", "planned", "done"]);
+    for (const status of feedbackStatuses) {
+      expect(updateFeedbackStatusSchema.parse({ status })).toEqual({ status });
+    }
+    expect(
+      updateFeedbackStatusSchema.safeParse({ status: "blocked" }).success,
+    ).toBe(false);
   });
 });
