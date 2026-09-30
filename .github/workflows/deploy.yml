@@ -128,6 +128,7 @@ jobs:
           node-version: "20.19"
           cache: npm
       - name: Validate deployment inputs and OIDC configuration
+        id: validate-inputs
         shell: bash
         env:
           TEAM_ID: ${{ inputs.teamId }}
@@ -135,6 +136,7 @@ jobs:
           TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
           SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          WORKSHOP_ALLOWED_CIDRS: ${{ vars.WORKSHOP_ALLOWED_CIDRS }}
         run: |
           set -euo pipefail
           if ! [[ "$TEAM_ID" =~ ^[a-z0-9][a-z0-9-]{1,18}[a-z0-9]$ ]]; then
@@ -147,6 +149,28 @@ jobs:
               exit 1
             fi
           done
+          cidrs_json="$(
+            python -c '
+          import ipaddress
+          import json
+          import os
+          import sys
+
+          raw = os.environ.get("WORKSHOP_ALLOWED_CIDRS", "").strip()
+          if not raw:
+              print("::error::Missing WORKSHOP_ALLOWED_CIDRS. Set the instructor-approved CIDR allowlist in the workshop environment.", file=sys.stderr)
+              sys.exit(1)
+          try:
+              networks = [ipaddress.ip_network(value.strip(), strict=True) for value in raw.split(",")]
+              if not 1 <= len(networks) <= 100:
+                  raise ValueError("supply between 1 and 100 CIDRs")
+          except ValueError as error:
+              print(f"::error::WORKSHOP_ALLOWED_CIDRS must be a comma-separated list of valid CIDR network addresses: {error}", file=sys.stderr)
+              sys.exit(1)
+          print(json.dumps([str(network) for network in networks], separators=(",", ":")))
+          '
+          )"
+          echo "workshop_allowed_cidrs=$cidrs_json" >> "$GITHUB_OUTPUT"
       - name: Build and test application
         run: |
           npm ci
@@ -168,6 +192,7 @@ jobs:
         env:
           TEAM_ID: ${{ inputs.teamId }}
           RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          WORKSHOP_ALLOWED_CIDRS_JSON: ${{ steps.validate-inputs.outputs.workshop_allowed_cidrs }}
         run: |
           set -euo pipefail
           deployment="$(
@@ -175,7 +200,9 @@ jobs:
               --name "workshop-${GITHUB_RUN_ID}" \
               --resource-group "$RESOURCE_GROUP" \
               --template-file infra/main.bicep \
-              --parameters infra/main.example.bicepparam teamIdentifier="$TEAM_ID" \
+              --parameters infra/main.example.bicepparam \
+                teamIdentifier="$TEAM_ID" \
+                workshopAllowedCidrs="$WORKSHOP_ALLOWED_CIDRS_JSON" \
               --output json
           )"
           app_name="$(jq -r '.properties.outputs.appName.value // empty' <<< "$deployment")"
@@ -197,6 +224,46 @@ jobs:
           --type zip
           --clean true
           --restart true
+      - name: Temporarily allow this runner for smoke verification
+        id: runner-access
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.infrastructure.outputs.app_name }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          WORKSHOP_ALLOWED_CIDRS_JSON: ${{ steps.validate-inputs.outputs.workshop_allowed_cidrs }}
+        run: |
+          set -euo pipefail
+          runner_ip="$(curl --fail --silent --show-error --max-time 20 https://api.ipify.org)"
+          RUNNER_IP="$runner_ip" WORKSHOP_ALLOWED_CIDRS_JSON="$WORKSHOP_ALLOWED_CIDRS_JSON" \
+            python -c '
+          import ipaddress
+          import json
+          import os
+          import sys
+
+          try:
+              runner = ipaddress.ip_address(os.environ["RUNNER_IP"])
+              networks = [ipaddress.ip_network(value) for value in json.loads(os.environ["WORKSHOP_ALLOWED_CIDRS_JSON"])]
+              if runner.version != 4:
+                  raise ValueError("the smoke-test runner must have an IPv4 egress address")
+              if any(runner in network for network in networks):
+                  raise ValueError("the runner is already inside the approved workshop allowlist, so outsider denial cannot be verified")
+          except ValueError as error:
+              print(f"::error::Cannot safely configure or verify temporary runner ingress: {error}", file=sys.stderr)
+              sys.exit(1)
+          '
+          rule_name="github-actions-${GITHUB_RUN_ID}"
+          az webapp config access-restriction add \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$APP_NAME" \
+            --rule-name "$rule_name" \
+            --priority 2000 \
+            --action Allow \
+            --ip-address "${runner_ip}/32" \
+            --description "Temporary deployment smoke verification run ${GITHUB_RUN_ID}" \
+            --output none
+          echo "runner_ip=$runner_ip" >> "$GITHUB_OUTPUT"
+          echo "runner_rule_name=$rule_name" >> "$GITHUB_OUTPUT"
       - name: Verify deployed health, readiness, and API
         id: verify
         shell: bash
@@ -256,6 +323,59 @@ jobs:
           echo "feedback_creation=true" >> "$GITHUB_OUTPUT"
           echo "first_vote=true" >> "$GITHUB_OUTPUT"
           echo "duplicate_vote_protection=true" >> "$GITHUB_OUTPUT"
+      - name: Remove runner ingress and verify outsider denial
+        id: runner-cleanup
+        if: ${{ always() && steps.infrastructure.outputs.app_name != '' }}
+        shell: bash
+        env:
+          APPLICATION_URL: ${{ steps.infrastructure.outputs.application_url }}
+          APP_NAME: ${{ steps.infrastructure.outputs.app_name }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          rule_name="github-actions-${GITHUB_RUN_ID}"
+          rule_count="$(
+            az webapp config access-restriction show \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$APP_NAME" \
+              --query "ipSecurityRestrictions[?name=='${rule_name}'] | length(@)" \
+              --output tsv
+          )"
+          if [ "$rule_count" != "0" ]; then
+            az webapp config access-restriction remove \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$APP_NAME" \
+              --rule-name "$rule_name" \
+              --output none
+          fi
+          remaining_rules="$(
+            az webapp config access-restriction show \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$APP_NAME" \
+              --query "ipSecurityRestrictions[?name=='${rule_name}'] | length(@)" \
+              --output tsv
+          )"
+          if [ "$remaining_rules" != "0" ]; then
+            echo "::error::Temporary runner ingress rule '$rule_name' remains; deployment evidence will not be published."
+            exit 1
+          fi
+
+          denied_status=""
+          for attempt in {1..12}; do
+            denied_status="$(
+              curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+                --connect-timeout 5 --max-time 10 "$APPLICATION_URL/health" || true
+            )"
+            if [ "$denied_status" = "403" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$denied_status" != "403" ]; then
+            echo "::error::Expected HTTP 403 from outside the workshop allowlist after runner-rule removal; received '$denied_status'."
+            exit 1
+          fi
+          echo "runner_rule_cleanup=true" >> "$GITHUB_OUTPUT"
       - name: Create machine-readable deployment evidence
         id: evidence
         shell: bash
@@ -270,6 +390,7 @@ jobs:
           FEEDBACK_CREATION: ${{ steps.verify.outputs.feedback_creation }}
           FIRST_VOTE: ${{ steps.verify.outputs.first_vote }}
           DUPLICATE_VOTE_PROTECTION: ${{ steps.verify.outputs.duplicate_vote_protection }}
+          RUNNER_RULE_CLEANUP: ${{ steps.runner-cleanup.outputs.runner_rule_cleanup }}
         run: |
           set -euo pipefail
           jq -c -n \
@@ -287,6 +408,7 @@ jobs:
             --argjson feedback_creation "$FEEDBACK_CREATION" \
             --argjson first_vote "$FIRST_VOTE" \
             --argjson duplicate_vote_protection "$DUPLICATE_VOTE_PROTECTION" \
+            --argjson runner_rule_cleanup "$RUNNER_RULE_CLEANUP" \
             '{
               schema_version: 1,
               commit_sha: $commit_sha,
@@ -304,7 +426,8 @@ jobs:
                 readiness: $readiness,
                 feedback_creation: $feedback_creation,
                 first_vote: $first_vote,
-                duplicate_vote_protection: $duplicate_vote_protection
+                duplicate_vote_protection: $duplicate_vote_protection,
+                runner_rule_cleanup: $runner_rule_cleanup
               },
               workflow_run_url: $workflow_run_url
             }' > deployment-evidence.json
@@ -317,6 +440,7 @@ jobs:
             (.azure.deployment_name | length > 0) and
             .environment == "workshop" and
             (.application_url | test("^https://")) and
+            .verification.runner_rule_cleanup == true and
             ([.verification[]] | all) and
             (.workflow_run_url | length > 0)
           ' deployment-evidence.json >/dev/null
@@ -339,7 +463,8 @@ jobs:
             echo "- Environment: \`workshop\`"
             echo "- URL: $APPLICATION_URL"
             echo "- Azure deployment: \`${{ steps.infrastructure.outputs.deployment_name }}\`"
-            echo "- Evidence artifact uploaded after health, readiness, and API smoke checks passed."
+            echo "- Health, readiness, feedback, voting, temporary-rule cleanup, and outside-network denial checks passed."
+            echo "- Evidence artifact uploaded only after all live checks passed."
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload deployment package
         if: always()
@@ -386,7 +511,7 @@ jobs:
           - Commit: \`$commit_sha\`
           - Environment: \`workshop\`
           - Azure deployment: \`$deployment_name\`
-          - Live checks: health, readiness, feedback creation, first vote, and duplicate-vote protection passed
+          - Live checks: health, readiness, feedback creation, first vote, duplicate-vote protection, runner-rule cleanup, and outside-network denial passed
           - Security checks: \`$security_status\`
           - Application: $application_url
           - [Workflow run and evidence artifact]($run_url)"

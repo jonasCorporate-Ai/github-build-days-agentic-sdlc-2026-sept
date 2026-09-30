@@ -45,6 +45,7 @@ describe("feedback API", () => {
     expect(created.body.feedback).toMatchObject({
       title: "Add a break",
       votes: 0,
+      status: "new",
     });
     const id = created.body.feedback.id as string;
 
@@ -69,6 +70,95 @@ describe("feedback API", () => {
     const list = await request(app).get("/api/feedback").expect(200);
     expect(list.body.items).toHaveLength(1);
     expect(list.body.items[0].votes).toBe(1);
+    expect(list.body.items[0].status).toBe("new");
+  });
+
+  it("persists adjacent status transitions without changing votes", async () => {
+    const app = createApp({
+      storage: new InMemoryFeedbackStorage(),
+      logger: silentLogger,
+    });
+    const created = await request(app)
+      .post("/api/feedback")
+      .send({
+        title: "Keep the vote",
+        description: "Status changes must preserve votes.",
+        category: "facilitation",
+        displayName: "Lin",
+      })
+      .expect(201);
+    const id = created.body.feedback.id as string;
+    await request(app)
+      .post(`/api/feedback/${id}/votes`)
+      .send({ clientId: "workshop-client" })
+      .expect(201);
+
+    await request(app)
+      .patch(`/api/feedback/${id}/status`)
+      .send({ status: "planned" })
+      .expect(200)
+      .expect(({ body }) =>
+        expect(body.feedback).toMatchObject({ status: "planned", votes: 1 }),
+      );
+    await request(app)
+      .patch(`/api/feedback/${id}/status`)
+      .send({ status: "done" })
+      .expect(200)
+      .expect(({ body }) =>
+        expect(body.feedback).toMatchObject({ status: "done", votes: 1 }),
+      );
+    await request(app)
+      .get("/api/feedback")
+      .expect(200)
+      .expect(({ body }) =>
+        expect(body.items).toContainEqual(
+          expect.objectContaining({ id, status: "done", votes: 1 }),
+        ),
+      );
+  });
+
+  it("rejects invalid, skipped, and missing status updates without changing state", async () => {
+    const app = createApp({
+      storage: new InMemoryFeedbackStorage(),
+      logger: silentLogger,
+    });
+    const created = await request(app)
+      .post("/api/feedback")
+      .send({
+        title: "Transition checks",
+        description: "Invalid transitions do not update feedback.",
+        category: "idea",
+        displayName: "Ada",
+      })
+      .expect(201);
+    const id = created.body.feedback.id as string;
+
+    await request(app)
+      .patch(`/api/feedback/${id}/status`)
+      .send({ status: "unsupported" })
+      .expect(400);
+    await request(app)
+      .patch(`/api/feedback/${id}/status`)
+      .send({ status: "done" })
+      .expect(409)
+      .expect(({ body }) =>
+        expect(body.error).toMatchObject({
+          code: "STATUS_CONFLICT",
+          message: expect.any(String),
+        }),
+      );
+    await request(app)
+      .patch("/api/feedback/missing/status")
+      .send({ status: "planned" })
+      .expect(404);
+    await request(app)
+      .get("/api/feedback")
+      .expect(200)
+      .expect(({ body }) =>
+        expect(body.items).toContainEqual(
+          expect.objectContaining({ id, status: "new" }),
+        ),
+      );
   });
 
   it("returns actionable validation without persisting", async () => {
